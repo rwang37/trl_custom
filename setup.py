@@ -95,7 +95,7 @@ try:
     os.symlink(os.path.join(file_path, "examples/scripts"), os.path.join(file_path, "trl/commands/scripts"))
 
     setup(
-        name="trl",
+        name="trl_custom",
         license="Apache 2.0",
         classifiers=[
             "Development Status :: 2 - Pre-Alpha",

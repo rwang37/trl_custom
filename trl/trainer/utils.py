@@ -1021,6 +1021,7 @@ def forward(
     attention_mask = query_responses != pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    # print(input_ids)
     return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -1144,7 +1145,14 @@ def generate(
     )
     logits = torch.stack(output.scores, 1)
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
-
+    # if generation_config.return_prompt:
+    #     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
+    # else:
+    #     print(torch.cat((queries, output.sequences[:, context_length:]), dim=1))
+    #     print(output.sequences[:, context_length:])
+    #     print(output.sequences)
+    #     print(context_length)
+    #     return output.sequences[:, context_length:], logits
 
 @torch.no_grad()
 def batch_generation(

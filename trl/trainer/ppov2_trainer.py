@@ -51,11 +51,12 @@ INVALID_LOGPROB = 1.0
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
-    def __init__(self, policy, value_model) -> None:
+    def __init__(self, policy, value_model, tokenizer) -> None:
         super().__init__()
         self.policy = policy
         self.value_model = value_model
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
+        self.tokenizer = tokenizer
 
     def forward(self, **kwargs):
         output = self.critic_backbone(
@@ -145,7 +146,9 @@ class PPOv2Trainer(Trainer):
             disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = tokenizer.eos_token_id
-        self.model = PolicyAndValueWrapper(policy, value_model)
+        #########################################################################
+        self.model = PolicyAndValueWrapper(policy, value_model, tokenizer)
+        #########################################################################
         self.model.config = policy.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
             num_training_steps=args.num_total_batches
@@ -250,11 +253,13 @@ class PPOv2Trainer(Trainer):
         iter_dataloader = iter(repeat_generator())
         generation_config = GenerationConfig(
             max_new_tokens=args.response_length,
-            min_new_tokens=args.response_length,
+            min_new_tokens=-1,
             temperature=(args.temperature + 1e-7),
             top_k=0.0,
             top_p=1.0,
+            eos_token_id=tokenizer.eos_token_id,
             do_sample=True,
+            repetition_penalty=1.2,
         )
 
         accelerator.print("===training policy===")
@@ -384,6 +389,7 @@ class PPOv2Trainer(Trainer):
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
+                # print(values.shape, padding_mask.shape)
                 values = torch.masked_fill(values, padding_mask_p1, 0)
 
                 # 4. compute rewards
@@ -414,6 +420,7 @@ class PPOv2Trainer(Trainer):
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 torch.cuda.empty_cache()
 
+            # print("Do multiple epochs of PPO training, with a fresh random shuffle in each epoch")
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
@@ -423,6 +430,7 @@ class PPOv2Trainer(Trainer):
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                     gradient_accumulation_idx = 0
                     for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size):
+                        # print("Loop3")
                         with accelerator.accumulate(model):
                             micro_batch_end = micro_batch_start + args.per_device_train_batch_size
                             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
@@ -434,6 +442,7 @@ class PPOv2Trainer(Trainer):
                             mb_values = values[micro_batch_inds]
 
                             output, vpred_temp = forward(model, mb_query_responses, tokenizer.pad_token_id)
+                            # print(vpred_temp.shape)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_all_logprobs = F.log_softmax(logits, dim=-1)
@@ -442,6 +451,7 @@ class PPOv2Trainer(Trainer):
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                            # print(vpred.shape, padding_mask_p1[micro_batch_inds].shape)
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
                             vpredclipped = torch.clamp(
                                 vpred,
@@ -566,11 +576,14 @@ class PPOv2Trainer(Trainer):
         args = self.args
         tokenizer = self.tokenizer
         generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
-            temperature=(0.01 + 1e-7),
+            max_new_tokens=args.response_length,
+            min_new_tokens=-1,
+            temperature=(args.temperature + 1e-7),
             top_k=0.0,
             top_p=1.0,
+            eos_token_id=tokenizer.eos_token_id,
             do_sample=True,
+            repetition_penalty=1.2,
         )
 
         table = defaultdict(list)
@@ -604,26 +617,25 @@ class PPOv2Trainer(Trainer):
                 if sampling:
                     break
         df = pd.DataFrame(table)
-
-        if self.accelerator.is_main_process:
+        if self.accelerator.process_index == 0:
             print_rich_table(df.iloc[0 : 0 + 5])
-            if "wandb" in args.report_to:
-                import wandb
+        if "wandb" in args.report_to:
+            import wandb
 
-                if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+            if wandb.run is not None:
+                wandb.log({"completions": wandb.Table(dataframe=df)})
 
     @wraps(Trainer.push_to_hub)
     def push_to_hub(
         self,
         commit_message: Optional[str] = "End of training",
         blocking: bool = True,
+        token: Optional[str] = None,
         **kwargs,
     ) -> str:
         """
         Overwrite the `push_to_hub` method in order to force-add the tag "ppo" when pushing the
         model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
-        Unlike the parent class, we don't use the `token` argument to mitigate security risks.
         """
         kwargs = trl_sanitze_kwargs_for_tagging(model=self.model, tag_names=self._tag_names, kwargs=kwargs)
-        return super().push_to_hub(commit_message=commit_message, blocking=blocking, **kwargs)
+        return super().push_to_hub(commit_message=commit_message, blocking=blocking, token=token, **kwargs)
